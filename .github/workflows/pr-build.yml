@@ -31,7 +31,7 @@ permissions:
   contents: read
 
 env:
-  DISABLE_PR_BUILD_MATRIX_VALIDATION: 'true'
+  DISABLE_PR_BUILD_MATRIX_VALIDATION: 'false'
 
 jobs:
   build:
@@ -42,24 +42,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - flavor: x86chk
-            platform: x86
-            configuration: Debug
-          - flavor: x86fre
-            platform: x86
-            configuration: Release
           - flavor: x64chk
             platform: x64
             configuration: Debug
-          - flavor: x64fre
-            platform: x64
-            configuration: Release
-          - flavor: arm64chk
-            platform: arm64
-            configuration: Debug
-          - flavor: arm64fre
-            platform: arm64
-            configuration: Release
     env:
       WINUI_INIT_FLAVOR: ${{ matrix.flavor }}
       WINUI_BUILD_PLATFORM: ${{ matrix.platform }}

@@ -1,6 +1,6 @@
 # PR build (OSS). Product-only compile gate; tests and signing run in internal ADO.
 
-name: PR Build
+name: Fork native product and tests
 
 on:
   pull_request:
@@ -31,7 +31,7 @@ permissions:
   contents: read
 
 env:
-  DISABLE_PR_BUILD_MATRIX_VALIDATION: 'true'
+  DISABLE_PR_BUILD_MATRIX_VALIDATION: 'false'
 
 jobs:
   build:
@@ -42,24 +42,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - flavor: x86chk
-            platform: x86
-            configuration: Debug
-          - flavor: x86fre
-            platform: x86
-            configuration: Release
           - flavor: x64chk
             platform: x64
             configuration: Debug
-          - flavor: x64fre
-            platform: x64
-            configuration: Release
-          - flavor: arm64chk
-            platform: arm64
-            configuration: Debug
-          - flavor: arm64fre
-            platform: arm64
-            configuration: Release
     env:
       WINUI_INIT_FLAVOR: ${{ matrix.flavor }}
       WINUI_BUILD_PLATFORM: ${{ matrix.platform }}
@@ -84,14 +69,35 @@ jobs:
           fetch-depth: 1
           show-progress: false
 
-      - name: Initialize build environment and build
-        if: env.DISABLE_PR_BUILD_MATRIX_VALIDATION != 'true'
+      - name: Build product and tests with repository build skill
         shell: pwsh
         run: |
-          & "${{ github.workspace }}/.github/scripts/build-pr.ps1" `
-            -Flavor $env:WINUI_INIT_FLAVOR `
-            -Platform $env:WINUI_BUILD_PLATFORM `
-            -Configuration $env:WINUI_BUILD_CONFIGURATION
+          $ErrorActionPreference = 'Stop'
+          $lp = 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem'
+          if ((Get-ItemProperty -Path $lp -Name LongPathsEnabled).LongPathsEnabled -ne 1) {
+            New-ItemProperty -Path $lp -Name LongPathsEnabled -Value 1 -PropertyType DWord -Force | Out-Null
+          }
+          foreach ($v in 'ACTIONS_RUNTIME_TOKEN','ACTIONS_RUNTIME_URL','ACTIONS_RESULTS_URL','ACTIONS_CACHE_URL','ACTIONS_ID_TOKEN_REQUEST_TOKEN','ACTIONS_ID_TOKEN_REQUEST_URL','GITHUB_TOKEN') {
+            Remove-Item "env:$v" -ErrorAction SilentlyContinue
+          }
+          & .\init.ps1 amd64chk /nopgo
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\initrun.ps1 .\build.cmd /q /b
+          exit $LASTEXITCODE
+
+      - name: Assemble native test payload
+        shell: pwsh
+        run: |
+          & .\initrun.ps1 powershell -ExecutionPolicy Bypass -File test\CreateTestPayload.ps1 -Platform x64 -Configuration chk -SkipSymbols -SkipWinUIGallery
+          exit $LASTEXITCODE
+
+      - name: Upload native test payload
+        uses: actions/upload-artifact@v6
+        with:
+          name: winui-native-tests-x64chk
+          path: TestPayload/x64chk/**
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Upload MSBuild binlogs
         if: failure() && env.DISABLE_PR_BUILD_MATRIX_VALIDATION != 'true'

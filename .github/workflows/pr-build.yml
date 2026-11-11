@@ -141,10 +141,12 @@ jobs:
             Pop-Location
             $results | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $out 'results.json')
             $candidates = @(
-              (Join-Path ([Environment]::GetFolderPath('MyPictures')) 'XamlTAEFOutput'),
               (Join-Path $env:USERPROFILE 'Pictures\XamlTAEFOutput'),
               'C:\Windows\System32\config\systemprofile\Pictures\XamlTAEFOutput'
-            ) | Select-Object -Unique
+            )
+            $pictures = [Environment]::GetFolderPath('MyPictures')
+            if ($pictures) { $candidates += Join-Path $pictures 'XamlTAEFOutput' }
+            $candidates = $candidates | Select-Object -Unique
             $index=0
             foreach($candidate in $candidates) {
               if(Test-Path -LiteralPath $candidate) {

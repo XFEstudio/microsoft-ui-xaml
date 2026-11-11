@@ -1,6 +1,6 @@
 # PR build (OSS). Product-only compile gate; tests and signing run in internal ADO.
 
-name: PR Build
+name: Fork native product and focused tests
 
 on:
   pull_request:
@@ -31,7 +31,7 @@ permissions:
   contents: read
 
 env:
-  DISABLE_PR_BUILD_MATRIX_VALIDATION: 'true'
+  DISABLE_PR_BUILD_MATRIX_VALIDATION: 'false'
 
 jobs:
   build:
@@ -42,24 +42,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - flavor: x86chk
-            platform: x86
-            configuration: Debug
-          - flavor: x86fre
-            platform: x86
-            configuration: Release
           - flavor: x64chk
             platform: x64
             configuration: Debug
-          - flavor: x64fre
-            platform: x64
-            configuration: Release
-          - flavor: arm64chk
-            platform: arm64
-            configuration: Debug
-          - flavor: arm64fre
-            platform: arm64
-            configuration: Release
     env:
       WINUI_INIT_FLAVOR: ${{ matrix.flavor }}
       WINUI_BUILD_PLATFORM: ${{ matrix.platform }}
@@ -84,14 +69,100 @@ jobs:
           fetch-depth: 1
           show-progress: false
 
-      - name: Initialize build environment and build
-        if: env.DISABLE_PR_BUILD_MATRIX_VALIDATION != 'true'
+      - name: Build product and tests with repository build skill
         shell: pwsh
         run: |
-          & "${{ github.workspace }}/.github/scripts/build-pr.ps1" `
-            -Flavor $env:WINUI_INIT_FLAVOR `
-            -Platform $env:WINUI_BUILD_PLATFORM `
-            -Configuration $env:WINUI_BUILD_CONFIGURATION
+          $ErrorActionPreference = 'Stop'
+          $lp = 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem'
+          if ((Get-ItemProperty -Path $lp -Name LongPathsEnabled).LongPathsEnabled -ne 1) {
+            New-ItemProperty -Path $lp -Name LongPathsEnabled -Value 1 -PropertyType DWord -Force | Out-Null
+          }
+          foreach ($v in 'ACTIONS_RUNTIME_TOKEN','ACTIONS_RUNTIME_URL','ACTIONS_RESULTS_URL','ACTIONS_CACHE_URL','ACTIONS_ID_TOKEN_REQUEST_TOKEN','ACTIONS_ID_TOKEN_REQUEST_URL','GITHUB_TOKEN') {
+            Remove-Item "env:$v" -ErrorAction SilentlyContinue
+          }
+          & .\init.ps1 amd64chk /nopgo
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\initrun.ps1 .\build.cmd /q /b
+          exit $LASTEXITCODE
+
+      - name: Assemble native test payload
+        shell: pwsh
+        run: |
+          & .\initrun.ps1 powershell -ExecutionPolicy Bypass -File test\CreateTestPayload.ps1 -Platform x64 -Configuration chk -SkipSymbols -SkipWinUIGallery
+          exit $LASTEXITCODE
+
+      - name: Upload native test payload
+        uses: actions/upload-artifact@v6
+        with:
+          name: winui-native-tests-x64chk
+          path: TestPayload/x64chk/**
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Run focused native tests on the disposable cloud desktop
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repoRoot = (Get-Location).Path
+          $out = Join-Path $repoRoot 'native-test-output'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          dotnet --list-runtimes | Set-Content (Join-Path $out 'runtimes.txt')
+          Get-FileHash TestPayload/x64chk/Test/Microsoft.UI.Xaml.dll -Algorithm SHA256 | ConvertTo-Json | Set-Content (Join-Path $out 'native-product-hash.json')
+          foreach ($v in 'ACTIONS_RUNTIME_TOKEN','ACTIONS_RUNTIME_URL','ACTIONS_RESULTS_URL','ACTIONS_CACHE_URL','ACTIONS_ID_TOKEN_REQUEST_TOKEN','ACTIONS_ID_TOKEN_REQUEST_URL','GITHUB_TOKEN') {
+            Remove-Item "env:$v" -ErrorAction SilentlyContinue
+          }
+          $cases = @(
+            @{id='first-line-alignment'; dll='Test\Microsoft.UI.Xaml.Tests.External.Controls.dll'; name='Microsoft::UI::Xaml::Tests::Controls::CheckBox::CheckBoxIntegrationTests::AlignsSelectionGlyphWithFirstLabelLine'},
+            @{id='checkbox-visual-tree'; dll='Test\Microsoft.UI.Xaml.Tests.External.Controls.dll'; name='Microsoft::UI::Xaml::Tests::Controls::CheckBox::CheckBoxIntegrationTests::ValidateUIElementTree'},
+            @{id='radiobutton-visual-tree'; dll='Test\Microsoft.UI.Xaml.Tests.External.Controls.dll'; name='Microsoft::UI::Xaml::Tests::Controls::RadioButton::RadioButtonIntegrationTests::ValidateUIElementTree'},
+            @{id='checkbox-high-contrast-dcomp'; dll='Test\Microsoft.UI.Xaml.Tests.External.Foundation.dll'; name='Microsoft::UI::Xaml::Tests::Foundation::Graphics::HighContrastAdjustmentTests::VerifyCheckBoxDCompTree'}
+          )
+          $results = @()
+          Push-Location TestPayload/x64chk
+          try {
+            foreach ($case in $cases) {
+              $dir = Join-Path $out $case.id
+              New-Item -ItemType Directory -Force -Path $dir | Out-Null
+              $select = "/select:@Name='$($case.name)'"
+              $list = & .\te.exe $case.dll '/p:HostingMode=WPF' '/p:SkipConsoleWindowMinimize' $select /list 2>&1
+              $listExit = $LASTEXITCODE
+              $list | Set-Content (Join-Path $dir 'list.txt')
+              $names = @($list | ForEach-Object { $_.ToString().Trim() } | Where-Object { $_ -match '^Microsoft::UI::Xaml::Tests::[A-Za-z0-9_:]+$' })
+              $class = $case.name.Substring(0, $case.name.LastIndexOf('::'))
+              $unexpected = @($names | Where-Object { $_ -cne $case.name -and $_ -cne $class })
+              if ($listExit -ne 0 -or $case.name -cnotin $names -or $unexpected.Count -gt 0) {
+                $results += @{id=$case.id; listExit=$listExit; executed=$false; reason='Selection not verified'; names=$names}
+                continue
+              }
+              & .\te.exe $case.dll '/p:HostingMode=WPF' '/p:SkipConsoleWindowMinimize' $select /labMode /enableWttLogging "/logFile:$($case.id).wtl" "/outputFolder:$dir" '/testTimeout:00:03:00' '/sessionTimeout:00:10:00' 2>&1 | Tee-Object -FilePath (Join-Path $dir 'run.txt')
+              $results += @{id=$case.id; listExit=$listExit; executed=$true; exit=$LASTEXITCODE; name=$case.name}
+            }
+          } finally {
+            Pop-Location
+            $results | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $out 'results.json')
+            $candidates = @(
+              (Join-Path ([Environment]::GetFolderPath('MyPictures')) 'XamlTAEFOutput'),
+              (Join-Path $env:USERPROFILE 'Pictures\XamlTAEFOutput'),
+              'C:\Windows\System32\config\systemprofile\Pictures\XamlTAEFOutput'
+            ) | Select-Object -Unique
+            $index=0
+            foreach($candidate in $candidates) {
+              if(Test-Path -LiteralPath $candidate) {
+                Copy-Item -LiteralPath $candidate -Destination (Join-Path $out "generated-masters-$index") -Recurse
+                $index++
+              }
+            }
+          }
+          if ($results.Count -ne 4 -or @($results | Where-Object { -not $_.executed -or $_.exit -ne 0 }).Count -gt 0) { exit 1 }
+
+      - name: Upload native test results and generated masters
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: native-test-results-x64chk
+          path: native-test-output/**
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Upload MSBuild binlogs
         if: failure() && env.DISABLE_PR_BUILD_MATRIX_VALIDATION != 'true'

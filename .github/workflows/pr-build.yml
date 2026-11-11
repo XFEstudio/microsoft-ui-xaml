@@ -1,113 +1,240 @@
-# PR build (OSS). Product-only compile gate; tests and signing run in internal ADO.
-
-name: PR Build
+name: Verify reviewed native rendering masters
 
 on:
-  pull_request:
-    branches:
-      - main
-      - winui3/main
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - '.github/ISSUE_TEMPLATE/**'
-      - '.github/PULL_REQUEST_TEMPLATE.md'
-      - '.github/policies/**'
-      - 'LICENSE'
-      - 'NOTICE.md'
-      - 'PRIVACY.md'
-      - 'privacy.md'
-      - 'SECURITY.md'
-      - 'CODE_OF_CONDUCT.md'
-      - 'CONTRIBUTING.md'
-      - 'CONTRIBUTING_feedback_and_requests.md'
-  workflow_dispatch: {}
-
-concurrency:
-  group: pr-build-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  workflow_dispatch:
+    inputs:
+      expected_pr_head:
+        description: 'Reviewed baseline-only PR commit; must be a direct child of f29c6c7'
+        required: true
+        type: string
 
 permissions:
   contents: read
-
-env:
-  DISABLE_PR_BUILD_MATRIX_VALIDATION: 'true'
+  actions: read
 
 jobs:
-  build:
-    name: Build (${{ matrix.flavor }})
+  verify:
     runs-on: windows-2022
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - flavor: x86chk
-            platform: x86
-            configuration: Debug
-          - flavor: x86fre
-            platform: x86
-            configuration: Release
-          - flavor: x64chk
-            platform: x64
-            configuration: Debug
-          - flavor: x64fre
-            platform: x64
-            configuration: Release
-          - flavor: arm64chk
-            platform: arm64
-            configuration: Debug
-          - flavor: arm64fre
-            platform: arm64
-            configuration: Release
+    timeout-minutes: 60
     env:
-      WINUI_INIT_FLAVOR: ${{ matrix.flavor }}
-      WINUI_BUILD_PLATFORM: ${{ matrix.platform }}
-      WINUI_BUILD_CONFIGURATION: ${{ matrix.configuration }}
-      BuildPlatform: ${{ matrix.platform }}
+      BuildPlatform: x64
       NUGET_PACKAGES: ${{ github.workspace }}\packages
       DOTNET_CLI_TELEMETRY_OPTOUT: '1'
       DOTNET_NOLOGO: '1'
-      # Cap CL.exe parallelism: hosted runner has 2 vCPUs; default /m:4 OOMs (C1076).
       CL: '/MP2'
-
     steps:
-      - name: Skip disabled PR Build validation
-        if: env.DISABLE_PR_BUILD_MATRIX_VALIDATION == 'true'
+      - name: Materialize text like the original Windows build
         shell: pwsh
-        run: Write-Host "PR Build matrix validation is disabled by DISABLE_PR_BUILD_MATRIX_VALIDATION."
+        run: |
+          if($env:GITHUB_REPOSITORY -cne 'XFEstudio/microsoft-ui-xaml' -or $env:RUNNER_OS -cne 'Windows' -or $env:GITHUB_ACTIONS -ne 'true') {throw 'Disposable fork Windows runner only.'}
+          git config --global core.autocrlf true
 
-      - name: Checkout
-        if: env.DISABLE_PR_BUILD_MATRIX_VALIDATION != 'true'
+      - name: Checkout exact verification commit
         uses: actions/checkout@v5
         with:
           fetch-depth: 1
           show-progress: false
 
-      - name: Initialize build environment and build
-        if: env.DISABLE_PR_BUILD_MATRIX_VALIDATION != 'true'
+      - name: Verify both source lineages and immutable payload identity
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_PR_HEAD: ${{ inputs.expected_pr_head }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_REPOSITORY -cne 'XFEstudio/microsoft-ui-xaml') { throw 'Fork-only verification.' }
+          $api='https://api.github.com/repos/XFEstudio/microsoft-ui-xaml'
+          $headers=@{Authorization=('Bearer '+$env:GH_TOKEN);Accept='application/vnd.github+json'}
+          function Read-Api([string]$path) { Invoke-RestMethod -Uri ($api+$path) -Headers $headers -TimeoutSec 45 }
+          function Check-Parent([string]$child,[string]$parent) {
+            $commit=Read-Api "/git/commits/$child"
+            if($commit.parents.Count -ne 1 -or $commit.parents[0].sha -cne $parent) {throw 'Unexpected single-parent lineage.'}
+          }
+          $old='f29c6c7ac101b82fe30652d31ea6aaca9170d2fb'
+          $expected=$env:EXPECTED_PR_HEAD
+          if($expected -cnotmatch '^[a-f0-9]{40}$') {throw 'Missing exact reviewed PR commit.'}
+          Check-Parent $expected $old
+          Check-Parent $env:GITHUB_SHA $expected
+          Check-Parent '991d14e21a0eafb6061a0a8fa67db67c0df6986b' 'a45c84851601b2d96c7c78588c47db26daef1bf1'
+          Check-Parent 'a45c84851601b2d96c7c78588c47db26daef1bf1' $old
+          $prefix='dxaml/test/resources/masters/Foundation_Graphics_HighContrastAdjustmentTests_VerifyCheckBoxDCompTree'
+          $blobs=@{
+            "$prefix.None.master.xml"='fecc447b3a2201f187d833a16395f65723af869c'
+            "$prefix.None_HC.master.xml"='6cdbdd6df217aa9812eb811689f04566f3e1dc3f'
+            "$prefix.HC.master.xml"='d876e2b95f61f3a8bb543320830e4078458379e7'
+          }
+          $candidate=Read-Api "/compare/$old...$expected"
+          if($candidate.ahead_by -ne 1 -or $candidate.behind_by -ne 0 -or $candidate.files.Count -ne 3) {throw 'Candidate scope differs.'}
+          foreach($file in $candidate.files) {
+            if(-not $blobs.ContainsKey($file.filename) -or $file.sha -cne $blobs[$file.filename] -or $file.additions -ne 6 -or $file.deletions -ne 6) {throw 'Unreviewed baseline diff.'}
+            $local=git hash-object "--path=$($file.filename)" -- $file.filename
+            if($LASTEXITCODE -ne 0 -or $local -cne $file.sha) {throw 'Checked-out master differs.'}
+          }
+          foreach($pair in @(@{base=$expected;head=$env:GITHUB_SHA;ahead=1},@{base=$old;head='991d14e21a0eafb6061a0a8fa67db67c0df6986b';ahead=2})) {
+            $comparison=Read-Api "/compare/$($pair.base)...$($pair.head)"
+            if($comparison.ahead_by -ne $pair.ahead -or $comparison.behind_by -ne 0 -or $comparison.files.Count -ne 1 -or $comparison.files[0].filename -cne '.github/workflows/pr-build.yml') {throw 'Verification changes production/test code.'}
+          }
+          $run=Read-Api '/actions/runs/42990972416'
+          $artifact=Read-Api '/actions/artifacts/13846885302'
+          if($run.head_sha -cne '991d14e21a0eafb6061a0a8fa67db67c0df6986b' -or $artifact.workflow_run.id -ne 42990972416 -or $artifact.name -cne 'winui-native-tests-x64chk' -or $artifact.expired -or $artifact.digest -cne 'sha256:2d52cb89f575703c43c0cb3820398533f260cf07af7d0ac5703486be7399529f') {throw 'Payload provenance differs.'}
+          New-Item -ItemType Directory native-test-output -Force | Out-Null
+          @{currentPR=$expected;oldPayloadPR=$old;verification=$env:GITHUB_SHA;masters=$blobs;artifactId=$artifact.id;artifactDigest=$artifact.digest;onlyWorkflowOutsideMasters=$true} | ConvertTo-Json -Depth 5 | Set-Content native-test-output/source-proof.json
+
+      - name: Download exact previously built product and native tests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: '13846885302'
+          run-id: '42990972416'
+          repository: XFEstudio/microsoft-ui-xaml
+          github-token: ${{ github.token }}
+          digest-mismatch: error
+          merge-multiple: true
+          path: TestPayload/x64chk
+
+      - name: Build only the reviewed resource DLL and replace it
         shell: pwsh
         run: |
-          & "${{ github.workspace }}/.github/scripts/build-pr.ps1" `
-            -Flavor $env:WINUI_INIT_FLAVOR `
-            -Platform $env:WINUI_BUILD_PLATFORM `
-            -Configuration $env:WINUI_BUILD_CONFIGURATION
+          $ErrorActionPreference = 'Stop'
+          $out=Join-Path (Get-Location).Path 'native-test-output'
+          $payload=(Resolve-Path TestPayload/x64chk).Path
+          function Get-PayloadManifest {
+            @(Get-ChildItem -LiteralPath $payload -Recurse -File | Sort-Object FullName | ForEach-Object {
+              @{path=$_.FullName.Substring($payload.Length+1).Replace('\','/');sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash}
+            })
+          }
+          $before=Get-PayloadManifest
+          $before | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $out 'payload-before.json')
+          $core=Get-FileHash TestPayload/x64chk/Test/Microsoft.UI.Xaml.dll -Algorithm SHA256
+          if($core.Hash -cne '477CA0BB62F9E71149589850FCD3AB61F5EBB5C1A17F290A9A46E9DBDDC0EB36') {throw 'Product DLL differs from original passing native tests.'}
+          $lp='HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem'
+          if((Get-ItemProperty -Path $lp -Name LongPathsEnabled).LongPathsEnabled -ne 1) {New-ItemProperty -Path $lp -Name LongPathsEnabled -Value 1 -PropertyType DWord -Force | Out-Null}
+          foreach($v in 'ACTIONS_RUNTIME_TOKEN','ACTIONS_RUNTIME_URL','ACTIONS_RESULTS_URL','ACTIONS_CACHE_URL','ACTIONS_ID_TOKEN_REQUEST_TOKEN','ACTIONS_ID_TOKEN_REQUEST_URL','GITHUB_TOKEN') {Remove-Item "env:$v" -ErrorAction SilentlyContinue}
+          & .\init.ps1 amd64chk /nopgo
+          if($LASTEXITCODE -ne 0) {exit $LASTEXITCODE}
+          $prefix='dxaml/test/resources/masters/Foundation_Graphics_HighContrastAdjustmentTests_VerifyCheckBoxDCompTree'
+          $capturedCRLF=@{
+            "$prefix.None.master.xml"='49D7D718AA13223CF554518F7ABDBA81CA261979AFD9819F9107D22F265EB118'
+            "$prefix.None_HC.master.xml"='E059BFF4612B613B852A9ACE94E327E045EA8A0E0E02F916536F86DEBAC621A8'
+            "$prefix.HC.master.xml"='998900D76E13F392E020839CB0216C91A1A07C9626CB55DEE6A081AB9A69C335'
+          }
+          foreach($item in $capturedCRLF.GetEnumerator()) {
+            $text=[IO.File]::ReadAllText((Join-Path (Get-Location).Path $item.Key)).Replace("`r`n","`n")
+            if($text.Contains("`r")) {throw 'Unexpected standalone CR.'}
+            [IO.File]::WriteAllText((Join-Path (Get-Location).Path $item.Key),$text.Replace("`n","`r`n"),[Text.UTF8Encoding]::new($false))
+            if((Get-FileHash -LiteralPath $item.Key -Algorithm SHA256).Hash -cne $item.Value) {throw 'Embedded master bytes differ from captured generated CRLF output.'}
+          }
+          $capturedCRLF | ConvertTo-Json | Set-Content (Join-Path $out 'materialized-master-sha256.json')
+          & .\initrun.ps1 msb /q dxaml\test\resources\masters\Private.Infrastructure.Resources.vcxproj /t:Rebuild /p:Configuration=Debug /p:Platform=x64 /m:2 2>&1 | Tee-Object -FilePath (Join-Path $out 'resource-build.txt')
+          $buildExit=$LASTEXITCODE
+          $binlog='BuildOutput/Private.Infrastructure.Resources.amd64chk.binlog'
+          if(Test-Path -LiteralPath $binlog) {Copy-Item -LiteralPath $binlog -Destination (Join-Path $out 'resource-build.binlog')}
+          if($buildExit -ne 0) {exit $buildExit}
+          $rebuilt='BuildOutput/bin/amd64chk/Test/Private.Infrastructure.Resources.dll'
+          $target=Join-Path $payload 'Test/Private.Infrastructure.Resources.dll'
+          if(-not(Test-Path -LiteralPath $rebuilt -PathType Leaf) -or -not(Test-Path -LiteralPath $target -PathType Leaf)) {throw 'Resource DLL missing.'}
+          Copy-Item -LiteralPath $rebuilt -Destination $target
+          $after=Get-PayloadManifest
+          $after | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $out 'payload-after.json')
+          if($before.Count -ne $after.Count) {throw 'Payload file count changed.'}
+          $changed=@()
+          for($i=0;$i -lt $before.Count;$i++) {
+            if($before[$i].path -cne $after[$i].path) {throw 'Payload file list changed.'}
+            if($before[$i].sha256 -cne $after[$i].sha256) {$changed+=$after[$i].path}
+          }
+          if($changed.Count -ne 1 -or $changed[0] -cne 'Test/Private.Infrastructure.Resources.dll') {throw 'Unexpected code or payload modification.'}
+          @{changed=$changed;rebuilt=(Get-FileHash -LiteralPath $rebuilt -Algorithm SHA256).Hash;deployed=(Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash;allOtherFilesUnchanged=$true} | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $out 'resource-replacement.json')
 
-      - name: Upload MSBuild binlogs
-        if: failure() && env.DISABLE_PR_BUILD_MATRIX_VALIDATION != 'true'
+      - name: Run focused native tests on the disposable cloud desktop
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $repoRoot = (Get-Location).Path
+          $out = Join-Path $repoRoot 'native-test-output'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          dotnet --list-runtimes | Set-Content (Join-Path $out 'runtimes.txt')
+          Get-FileHash TestPayload/x64chk/Test/Microsoft.UI.Xaml.dll -Algorithm SHA256 | ConvertTo-Json | Set-Content (Join-Path $out 'native-product-hash.json')
+          foreach ($v in 'ACTIONS_RUNTIME_TOKEN','ACTIONS_RUNTIME_URL','ACTIONS_RESULTS_URL','ACTIONS_CACHE_URL','ACTIONS_ID_TOKEN_REQUEST_TOKEN','ACTIONS_ID_TOKEN_REQUEST_URL','GITHUB_TOKEN') {
+            Remove-Item "env:$v" -ErrorAction SilentlyContinue
+          }
+          $cases = @(
+            @{id='first-line-alignment'; dll='Test\Microsoft.UI.Xaml.Tests.External.Controls.dll'; name='Microsoft::UI::Xaml::Tests::Controls::CheckBox::CheckBoxIntegrationTests::AlignsSelectionGlyphWithFirstLabelLine'},
+            @{id='checkbox-visual-tree'; dll='Test\Microsoft.UI.Xaml.Tests.External.Controls.dll'; name='Microsoft::UI::Xaml::Tests::Controls::CheckBox::CheckBoxIntegrationTests::ValidateUIElementTree'},
+            @{id='radiobutton-visual-tree'; dll='Test\Microsoft.UI.Xaml.Tests.External.Controls.dll'; name='Microsoft::UI::Xaml::Tests::Controls::RadioButton::RadioButtonIntegrationTests::ValidateUIElementTree'},
+            @{id='checkbox-high-contrast-dcomp'; dll='Test\Microsoft.UI.Xaml.Tests.External.Foundation.dll'; name='Microsoft::UI::Xaml::Tests::Foundation::Graphics::HighContrastAdjustmentTests::VerifyCheckBoxDCompTree'}
+          )
+          $results = @()
+          Push-Location TestPayload/x64chk
+          try {
+            foreach ($case in $cases) {
+              $dir = Join-Path $out $case.id
+              New-Item -ItemType Directory -Force -Path $dir | Out-Null
+              $select = "/select:@Name='$($case.name)'"
+              $list = & .\te.exe $case.dll '/p:HostingMode=WPF' '/p:SkipConsoleWindowMinimize' $select /list 2>&1
+              $listExit = $LASTEXITCODE
+              $list | Set-Content (Join-Path $dir 'list.txt')
+              $names = @($list | ForEach-Object { $_.ToString().Trim() } | Where-Object { $_ -match '^Microsoft::UI::Xaml::Tests::[A-Za-z0-9_:]+$' })
+              $class = $case.name.Substring(0, $case.name.LastIndexOf('::'))
+              $unexpected = @($names | Where-Object { $_ -cne $case.name -and $_ -cne $class })
+              if ($listExit -ne 0 -or $case.name -cnotin $names -or $unexpected.Count -gt 0) {
+                $results += @{id=$case.id; listExit=$listExit; executed=$false; reason='Selection not verified'; names=$names}
+                continue
+              }
+              $run = & .\te.exe $case.dll '/p:HostingMode=WPF' '/p:SkipConsoleWindowMinimize' $select /enableWttLogging "/logFile:$($case.id).wtl" "/outputFolder:$dir" '/testTimeout:00:03:00' '/sessionTimeout:00:10:00' 2>&1 | Tee-Object -FilePath (Join-Path $dir 'run.txt')
+              $runExit = $LASTEXITCODE
+              $lines = @($run | ForEach-Object { $_.ToString().Trim() })
+              $summaryPass = @($lines | Where-Object { $_ -ceq 'Summary: Total=1, Passed=1, Failed=0, Blocked=0, Not Run=0, Skipped=0' }).Count -eq 1
+              $groupPass = @($lines | Where-Object { $_ -ceq "EndGroup: $($case.name) [Passed]" }).Count -eq 1
+              $comparisons = @($lines | Where-Object { $_ -clike 'Comparing files for variation: *' })
+              $comparisonSuccessCount = @($lines | Where-Object { $_ -ceq 'Verify: IsTrue(didOutputMatchMaster)' }).Count
+              $bodyPass = $false
+              if ($case.id -eq 'first-line-alignment') {
+                $bodyPass = (@($lines | Where-Object { $_ -ceq 'Verify: IsTrue(firstLine.Height > 0)' }).Count -eq 16) -and
+                  (@($lines | Where-Object { $_ -ceq 'Verify: IsTrue(label->ActualHeight > firstLine.Height)' }).Count -eq 8) -and
+                  (@($lines | Where-Object { $_ -ceq 'Verify: IsTrue(std::abs(textCenter - glyphCenter) < 0.1f)' }).Count -eq 12) -and
+                  (@($lines | Where-Object { $_ -ceq 'Verify: IsTrue(textCenter < glyph->ActualHeight / 2)' }).Count -eq 4) -and
+                  (@($lines | Where-Object { $_ -ceq 'Verify: IsTrue(std::abs(glyphCenter - glyph->ActualHeight / 2) < 0.1)' }).Count -eq 4)
+              } elseif ($case.id -eq 'checkbox-high-contrast-dcomp') {
+                $bodyPass = $comparisons.Count -eq 12 -and $comparisonSuccessCount -eq 12 -and
+                  (@($comparisons | Where-Object { $_ -ceq 'Comparing files for variation: None' }).Count -eq 6) -and
+                  (@($comparisons | Where-Object { $_ -ceq 'Comparing files for variation: None_HC' }).Count -eq 3) -and
+                  (@($comparisons | Where-Object { $_ -ceq 'Comparing files for variation: HC' }).Count -eq 3)
+              } else {
+                $bodyPass = $comparisons.Count -eq 3 -and $comparisonSuccessCount -eq 3 -and
+                  (@($comparisons | Where-Object { $_ -ceq 'Comparing files for variation: Dark' }).Count -eq 1) -and
+                  (@($comparisons | Where-Object { $_ -ceq 'Comparing files for variation: Light' }).Count -eq 1) -and
+                  (@($comparisons | Where-Object { $_ -ceq 'Comparing files for variation: HC' }).Count -eq 1) -and
+                  (@($lines | Where-Object { $_ -ceq 'Validate High-Contrast Colors.' }).Count -eq 1)
+              }
+              $results += @{id=$case.id; listExit=$listExit; executed=$true; exit=$runExit; name=$case.name; summaryPassed=$summaryPass; methodPassed=$groupPass; bodyValidated=$bodyPass; comparisonCount=$comparisons.Count; comparisonSuccessCount=$comparisonSuccessCount}
+            }
+          } finally {
+            Pop-Location
+            $results | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $out 'results.json')
+            $candidates = @(
+              (Join-Path $env:USERPROFILE 'Pictures\XamlTAEFOutput'),
+              'C:\Windows\System32\config\systemprofile\Pictures\XamlTAEFOutput',
+              'C:\Users\Public\Pictures\XamlTAEFOutput'
+            )
+            $pictures = [Environment]::GetFolderPath('MyPictures')
+            if ($pictures) { $candidates += Join-Path $pictures 'XamlTAEFOutput' }
+            $candidates = $candidates | Select-Object -Unique
+            $index=0
+            foreach($candidate in $candidates) {
+              if(Test-Path -LiteralPath $candidate) {
+                Copy-Item -LiteralPath $candidate -Destination (Join-Path $out "generated-masters-$index") -Recurse
+                $index++
+              }
+            }
+          }
+          if ($results.Count -ne 4 -or @($results | Where-Object { -not $_.executed -or $_.exit -ne 0 -or -not $_.summaryPassed -or -not $_.methodPassed -or -not $_.bodyValidated }).Count -gt 0) { exit 1 }
+
+      - name: Upload native test results and generated masters
+        if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: binlogs-${{ matrix.flavor }}
-          path: BuildOutput/**/*.binlog
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Upload product runtime payload
-        if: env.DISABLE_PR_BUILD_MATRIX_VALIDATION != 'true'
-        uses: actions/upload-artifact@v6
-        with:
-          name: winui-product-${{ matrix.flavor }}
-          path: |
-            BuildOutput/packaging/${{ matrix.configuration }}/runtimes-framework/win-${{ matrix.platform }}/**
+          name: native-test-results-x64chk
+          path: native-test-output/**
           if-no-files-found: warn
           retention-days: 7
+
